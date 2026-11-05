@@ -16,10 +16,10 @@ const cats = {
   amber: { name:'琥珀', stars:5, traits:'安静 · 亲人 · 好奇 · 爱玩' }
 };
 const guests = [
-  { name: '小林', hint: '想在窗边看会儿书。要是有只安静的猫就更好了。', cat: 'sesame', drink: '原味拿铁', stay:1 },
-  { name: '阿遥', hint: '刚下班，想点杯咖啡，再找只猫玩一会儿。', cat: 'pudding', drink: '卡布奇诺', stay:1 },
-  { name: '周老师', hint: '带了速写本，想画一只会自己凑过来的小猫。', cat: 'chestnut', drink: '蜂蜜拿铁', stay:2 },
-  { name: '许邻居', hint: '在等雨停。哪只猫愿意陪我坐一会儿？', cat: 'sesame', drink: '美式咖啡', stay:1 }
+  { name: '小林', hint: '想在窗边看会儿书。要是有只安静的猫就更好了。', cat: 'sesame', coffee: 'latte', dessert:'sponge', stay:1 },
+  { name: '阿遥', hint: '刚下班，想点杯咖啡，再找只猫玩一会儿。', cat: 'pudding', coffee: 'cappuccino', dessert:'sponge', stay:1 },
+  { name: '周老师', hint: '带了速写本，想画一只会自己凑过来的小猫。', cat: 'chestnut', coffee: 'honey', dessert:'honeycake', stay:2 },
+  { name: '许邻居', hint: '在等雨停。哪只猫愿意陪我坐一会儿？', cat: 'sesame', coffee: 'americano', dessert:'sponge', stay:1 }
 ];
 const clues = [
   { title: '旧猫毯', detail: '她给猫留了一个靠近自己的位置，但希望猫可以自己决定什么时候过来。', x: 22, y: 39 },
@@ -46,8 +46,15 @@ function icon(name) {
   return '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + icons[name] + '</svg>';
 }
 
+const hourMs = 45000;
+const periodMs = hourMs * 1.5;
+const closingMs = hourMs * 9;
+const energyCap = 16;
+const energyInterval = 120000;
+const pantryCost = 4;
+const regularOrderCost = 2;
 const storageKey = 'cats-and-cafe-prototype-v1';
-const fresh = () => ({ coins: 48, points: 0, beans: 4, milk: 4, honey: 1, menu: false, served: 0, turn: 0, period:0, morning:false, workers:{}, flour:2, pastries:{}, guest: 0, progress: 'locked', found: [], deadline: 0, away: null, pending: null, album: [], tables: [], roster:[], shift:[], opened:false, storySeen:false, diningLevel:0, theme:"spring", pity:0, capacity:4, cans:0, kibble:1, care:{}, energy:{day:realDay(),value:5}, cleared:[], puzzle:null });
+const fresh = () => ({ coins:48, points:0, beans:4, milk:4, honey:1, menu:false, served:0, turn:0, clockMs:0, arrivalsUsed:0, orderAttempts:0, morning:false, workers:{}, flour:2, pastries:{}, guest:0, progress:'locked', found:[], deadline:0, away:null, pending:null, album:[], tables:[], roster:[], shift:[], opened:false, storySeen:false, diningLevel:0, theme:'spring', pity:0, capacity:4, cans:0, kibble:1, care:{}, energy:{value:energyCap,updatedAt:Date.now()}, cleared:[], puzzle:null });
 function restore() {
   try {
     const saved = JSON.parse(localStorage.getItem(storageKey));
@@ -58,24 +65,30 @@ function restore() {
       if (!Array.isArray(saved.shift)) state.shift = state.opened ? state.roster.slice(0,4) : [];
       if (typeof saved.storySeen !== 'boolean') state.storySeen = true;
       if (!Number.isInteger(saved.diningLevel)) state.diningLevel = state.opened ? 2 : 0;
-      if (!Number.isInteger(saved.period)) state.tables = state.tables.map(table=>({...table,until:Math.min(table.until,state.turn+2)}));
+      if (!Number.isFinite(saved.clockMs)) {
+        state.clockMs = Math.min(6,Math.max(0,saved.period || 0))*periodMs;
+        state.tables = state.tables.map(table=>({...table,leaveAt:state.clockMs+Math.min(2,Math.max(0,table.until-state.turn || 0))*hourMs})).filter(table=>table.leaveAt > state.clockMs);
+        state.orderAttempts = Math.min(3,state.served);
+        state.energy = fresh().energy;
+        state.puzzle = null;
+      }
+      if (state.away && !Number.isFinite(state.away.returnAt)) state.away.returnAt = Date.now()+hourMs;
       return state;
     }
   } catch {}
   return fresh();
 }
 let s = restore();
-let tab = s.storySeen ? 'shop' : 'story';
+let tab = s.storySeen ? (boardActive() ? 'board' : 'shop') : 'story';
 let storyPage = 0;
 let diningRoom = 0;
 let selected = '';
-let drink = 'latte';
-let brewStep = 0;
-let ingredientSelected = '';
-let heatStart = null;
-let milkTemperature = null;
+let orderGuest = -1;
+let orderPeriod = -1;
 let lounge = false;
 let joiningSeat = null;
+let lastClockTick = performance.now();
+let lastClockSave = 0;
 let toastTimeout;
 const workspace = document.querySelector('#workspace');
 const dialog = document.querySelector('#dialog');
@@ -97,24 +110,53 @@ function refresh() {
 }
 function go(next) {
   tab = next;
-  if (next !== 'brew') { selected = ''; heatStart = null; }
-  if (next !== 'board') mergeSelected = null;
+  selected = '';
+  if (next === 'order') { orderGuest = nextGuest(); orderPeriod = Math.floor(s.clockMs/periodMs); }
   render();
   workspace.focus({preventScroll:true});
 }
-const hours = ['10:00','11:30','13:00','14:30','16:00','17:30','19:00'];
-function afterHours() { return s.period === hours.length-1; }
+function boardActive() { return ['playing','ready'].includes(s.puzzle?.status); }
+function afterHours() { return s.clockMs >= closingMs; }
 function isTrading() { return s.opened && !s.morning && !afterHours(); }
-function advancePeriod() {
-  if (!isTrading()) return;
-  s.period += 1;
-  advance();
+function clockText() {
+  const minute = 600+Math.floor(Math.min(s.clockMs,closingMs)/hourMs*60);
+  return String(Math.floor(minute/60)).padStart(2,'0') + ':' + String(minute%60).padStart(2,'0');
+}
+function secLeft(ms) { return Math.max(0,Math.ceil(ms/1000)); }
+function tableSeconds(table) { return secLeft(table.leaveAt-s.clockMs); }
+function periodElapsed() { return s.clockMs%periodMs; }
+function arrivals() { return seatCount() >= 4 ? [0,28000,47000] : [0,30000]; }
+function arrivalCount() { return isTrading() ? arrivals().filter(at=>at <= periodElapsed()).length : 0; }
+function waitingCount() { return Math.max(0,arrivalCount()-s.arrivalsUsed); }
+function futureArrivals() { return isTrading() ? arrivals().length-arrivalCount() : 0; }
+function nextGuest() {
+  if (!waitingCount()) return -1;
+  for (let i=0;i<guests.length;i+=1) {
+    const index = (s.guest+i)%guests.length;
+    if (!s.tables.some(table=>table.guest===index)) return index;
+  }
+  return -1;
+}
+function canSkipPeriod() { return isTrading() && !boardActive() && !waitingCount() && !futureArrivals(); }
+function advanceClock(elapsed) {
+  if (!s.opened || s.morning || boardActive() || (afterHours() && !s.tables.length)) return false;
+  const before = s.clockMs;
+  const beforeArrivals = arrivalCount();
+  const skipped = isTrading() ? arrivals().length-s.arrivalsUsed : 0;
+  const beforeTables = s.tables.length;
+  s.clockMs += elapsed;
+  const periodChanged = Math.min(6,Math.floor(before/periodMs)) !== Math.min(6,Math.floor(s.clockMs/periodMs));
+  if (periodChanged) { s.guest += skipped; s.arrivalsUsed = 0; s.turn += 1; }
+  s.tables = s.tables.filter(table=>table.leaveAt > s.clockMs);
+  const tableLeft = s.tables.length !== beforeTables;
+  if (tableLeft && !s.tables.some(table=>table.seat===joiningSeat)) joiningSeat = null;
+  return periodChanged || tableLeft || beforeArrivals !== arrivalCount();
 }
 function nextMorning() {
-  if (!s.opened || s.morning || !afterHours()) return;
-  advance();
-  s.tables = [];
-  s.period = 0;
+  if (!s.opened || s.morning || !afterHours() || s.tables.length) return;
+  s.clockMs = 0;
+  lastClockTick = performance.now();
+  s.arrivalsUsed = 0;
   s.morning = true;
   for (const id of catIds()) {
     const info = careState(id);
@@ -124,22 +166,19 @@ function nextMorning() {
     }
   }
   joiningSeat = null; lounge = false; diningRoom = 0; save(); go('shop');
-  note('新的一天。先做一张晨间订单，领开店金币。');
+  note('新的一天。先做一张免费的晨间订单。');
 }
-function advance() {
-  s.turn += 1;
-  s.tables = s.tables.filter(table => table.until > s.turn);
-  if (s.away && s.turn >= s.away.until) {
-    const cat = s.away.cat;
-    const score = outcomes[cat].base + (s.away.clues >= 2 ? 1 : 0);
-    s.pending = { id: 'visit-' + s.turn, template: 'lin-home-v1', cat, score };
-    s.away = null;
-    s.progress = 'mail';
-    return true;
-  }
-  return false;
+function finishVisit() {
+  if (!s.away || Date.now() < s.away.returnAt) return false;
+  const cat = s.away.cat;
+  const score = outcomes[cat].base + (s.away.clues >= 2 ? 1 : 0);
+  s.pending = { id:'visit-'+s.away.returnAt, template:'lin-home-v1', cat, score };
+  s.away = null;
+  s.progress = 'mail';
+  return true;
 }
 function catBusy(id) {
+  if (boardActive() && s.puzzle.order?.cat === id) return '正在备餐';
   if (s.away?.cat === id) return '上门陪伴中';
   if (careState(id).recovery) return '休息恢复中';
   const table = s.tables.find(item => item.cat === id);
@@ -148,7 +187,7 @@ function catBusy(id) {
 function availableSeat() {
   for (let offset = 0; offset < seatCount(); offset += 1) {
     const index = (s.served + offset) % seatCount();
-    if (!s.tables.some(table => table.seat === index)) return index;
+    if ((!boardActive() || s.puzzle.order?.seat !== index) && !s.tables.some(table => table.seat === index)) return index;
   }
   return -1;
 }
@@ -160,12 +199,13 @@ function matchList() {
   }).join('');
 }
 function screen(title, kicker, content, back = 'shop') {
-  workspace.innerHTML = '<header class="screen-head"><button class="back" type="button" data-act="tab" data-id="' + back + '" aria-label="返回">‹</button><div><h1>' + title + '</h1><p>' + kicker + '</p></div>' + (s.opened && !['renovate','brew','board','clues'].includes(tab) ? goalButton() : '') + '</header><div class="screen-body">' + content + '</div>';
+  const backButton = back ? '<button class="back" type="button" data-act="' + (back === 'abandon-board' ? 'abandon' : 'tab') + '" data-id="' + back + '" aria-label="返回">‹</button>' : '';
+  workspace.innerHTML = '<header class="screen-head">' + backButton + '<div><h1>' + title + '</h1><p>' + kicker + '</p></div>' + (s.opened && !['renovate','board','clues'].includes(tab) ? goalButton() : '') + '</header><div class="screen-body">' + content + '</div>';
 }
 function render() {
   document.documentElement.dataset.theme = s.theme;
-  document.querySelector('#tabs').hidden = tab === 'story';
-  const active = { order:'shop', brew:'shop', adopt:'shop', care:'shop', shift:'shop', renovate:'stock', team:'stock', board:'pantry', clues:'mail', dispatch:'mail', letter:'mail' }[tab] ?? tab;
+  document.querySelector('#tabs').hidden = tab === 'story' || (tab === 'board' && boardActive());
+  const active = { order:'shop', adopt:'shop', care:'shop', shift:'shop', renovate:'stock', team:'stock', board:'pantry', clues:'mail', dispatch:'mail', letter:'mail' }[tab] ?? tab;
   document.querySelector('#tabs').innerHTML = [['shop','猫咖'], ['pantry','备料'], ['mail','委托'], ['photo','相册'], ['stock','店务']].map(([id, label]) =>
     '<button type="button" class="tab" data-act="tab" data-id="' + id + '" aria-current="' + (active === id) + '">' + icon(id === 'stock' ? 'cup' : id === 'pantry' ? 'leaf' : id) + label + (id === 'mail' && (s.pending || s.progress === 'ready') ? '<em>' + (s.pending ? '新信' : '新') + '</em>' : '') + '</button>').join('');
   switch (tab) {
@@ -173,7 +213,6 @@ function render() {
     case 'shop': renderShop(); break;
     case 'renovate': renderRenovation(); break;
     case 'order': renderOrder(); break;
-    case 'brew': renderBrew(); break;
     case 'stock': renderStock(); break;
     case 'team': renderTeam(); break;
     case 'adopt': renderAdoption(); break;
@@ -258,56 +297,114 @@ function guestActor(index, table = null) {
   const label = seat ? guest.name + ' · ' + (table.seat + 1) + '号桌' : guest.name + ' · 点单';
   const art = joining || !seat ? peopleAnimation[index].walk : peopleAnimation[index].sit;
   const after = joining ? peopleAnimation[index].sit : peopleAnimation[index].idle;
-  const content = animationArt(art) + (joining || !seat ? animationArt(after, 'after-walk') : '') + '<span class="actor-label">' + label + '</span>';
+  const content = animationArt(art) + (joining || !seat ? animationArt(after, 'after-walk') : '') + '<span class="actor-label">' + label + (table ? '<small>' + tableTimer(table) + '后离座</small>' : '') + '</span>';
   const action = seat ? 'table' : 'tab';
   return '<button class="actor guest ' + (seat ? joining ? 'seating' : 'seated' : 'arriving') + '" type="button" data-act="' + action + '" data-id="' + (seat ? table.seat : 'order') + '" aria-label="' + (seat ? label : '接待' + guest.name) + '" style="' + style + '">' + content + '</button>';
 }
 function floorHeader(clock) {
-  return '<div class="scene-top"><div class="status-row"><span class="stat day-tag">' + (s.opened ? (s.morning ? '开店前备料' : afterHours() ? '19:00 · 打烊' : '营业时段 ' + clock) : '筹备中') + '</span><div class="stats"><span class="stat" aria-label="金币 ' + s.coins + '">' + icon('coin') + ' ' + s.coins + '</span><span class="stat" aria-label="营业积分 ' + s.points + '">' + icon('leaf') + ' ' + s.points + '</span></div></div><div class="sign"><h1>Cats <i>&amp;</i> Cafe</h1><p>' + (lounge ? '猫舍 · 休息与照顾' : isTrading() ? '街角猫咖 · 营业中' : s.opened ? '街角猫咖 · 暂未接单' : '街角猫咖 · 筹备中') + '</p></div><div class="floor-switch" aria-label="场景切换"><button type="button" data-act="floor" data-id="dining" aria-pressed="' + (!lounge && diningRoom === 0) + '">餐厅</button>' + (seatCount() > 4 ? '<button type="button" data-act="floor" data-id="annex" aria-pressed="' + (!lounge && diningRoom === 1) + '">阳光间</button>' : '') + '<button type="button" data-act="floor" data-id="lounge" aria-pressed="' + lounge + '">猫舍</button></div></div>';
+  return '<div class="scene-top"><div class="status-row"><span class="stat day-tag" data-clock>' + (s.opened ? (s.morning ? '开店前备料' : afterHours() ? '19:00 · 打烊' : '营业时段 ' + clock) : '筹备中') + '</span><div class="stats"><span class="stat" aria-label="金币 ' + s.coins + '">' + icon('coin') + ' ' + s.coins + '</span><span class="stat" aria-label="营业积分 ' + s.points + '">' + icon('leaf') + ' ' + s.points + '</span></div></div><div class="sign"><h1>Cats <i>&amp;</i> Cafe</h1><p>' + (lounge ? '猫舍 · 休息与照顾' : isTrading() ? '街角猫咖 · 营业中' : s.opened ? '街角猫咖 · 暂未接单' : '街角猫咖 · 筹备中') + '</p></div><div class="floor-switch" aria-label="场景切换"><button type="button" data-act="floor" data-id="dining" aria-pressed="' + (!lounge && diningRoom === 0) + '">餐厅</button>' + (seatCount() > 4 ? '<button type="button" data-act="floor" data-id="annex" aria-pressed="' + (!lounge && diningRoom === 1) + '">阳光间</button>' : '') + '<button type="button" data-act="floor" data-id="lounge" aria-pressed="' + lounge + '">猫舍</button></div></div>';
+}
+function actionButton(label, act, id='', type='primary') {
+  return '<button class="' + type + '" type="button" data-act="' + act + '" data-id="' + id + '">' + label + '</button>';
+}
+function tableTimer(table) {
+  return '<span data-seat-timer="' + table.seat + '">' + tableSeconds(table) + ' 秒</span>';
+}
+function catStatus(id) {
+  const table = s.tables.find(item=>item.cat === id);
+  const info = careState(id);
+  if (table) return '陪客 · ' + tableTimer(table);
+  if (s.away?.cat === id) return '外出委托';
+  if (info.recovery) return '恢复中';
+  if (restRequired(id)) return '猫舍休息';
+  if (isTrading() && s.shift.includes(id)) return '可接待';
+  return '猫舍待命';
+}
+function catRail() {
+  return '<div class="cat-rail" aria-label="猫咪状态">' + catIds().map(id=>{
+    const stamina = careState(id).stamina;
+    return '<button class="cat-chip' + (stamina < minWorkStamina ? ' tired' : '') + '" type="button" data-act="inspect-cat" data-id="' + id + '"><img src="' + avatars[id] + '" alt=""><span><b>' + cats[id].name + ' <small>' + stamina + '</small></b><small>' + catStatus(id) + '</small><i aria-hidden="true"><i style="width:' + stamina + '%"></i></i></span></button>';
+  }).join('') + '</div>';
+}
+function schedulePanel() {
+  const upcoming = futureArrivals();
+  const nextAt = arrivals()[arrivalCount()];
+  const waiting = waitingCount();
+  return '<aside class="schedule-panel" aria-label="营业时段"><div><b>' + (waiting ? waiting + ' 位等候' : '当前无人等候') + '</b><span>本时段剩 <b data-period-timer>' + secLeft(periodMs-periodElapsed()) + ' 秒</b></span></div><progress data-period-progress max="' + periodMs + '" value="' + periodElapsed() + '" aria-label="本时段进度"></progress><div><span>' + (upcoming ? '还会来 ' + upcoming + ' 位 · 下位约 <b data-arrival-timer>' + secLeft(nextAt-periodElapsed()) + ' 秒</b>' : '本时段来客已到齐') + '</span>' + (canSkipPeriod() ? actionButton('快进', 'next-period', '', 'schedule-skip') : '') + '</div></aside>';
+}
+function canSubstitute() {
+  const bench = catIds().some(id=>!s.shift.includes(id) && !staffStatus(id,false));
+  return bench && (s.shift.length < maxShift || s.shift.some(id=>!catBusy(id)));
+}
+function orderProblem(index) {
+  if (!isTrading() || index < 0) return '还没有可以接待的客人';
+  if (availableSeat() < 0) return '桌位已满，客人会自动离座';
+  if (catIds().every(id=>staffStatus(id))) return '现在没有空闲当班猫咪';
+  if (!coffeeMenu[guestCoffee(guests[index])].stock.every(key=>s[key] > 0)) return '原料不足，需要补货';
+  if (s.energy.value < orderCost()) return '体力不足，等待恢复';
+  return '';
 }
 function renderShop() {
-  const index = s.guest % guests.length;
+  const index = nextGuest();
   const guest = guests[index];
-  const clock = hours[s.period];
+  const clock = clockText();
   const target = goalButton(true);
   if (!s.opened && !lounge) { renderOnboarding(clock); return; }
-  const callout = s.pending ? '<button class="primary mail-float" type="button" data-act="open-mail">' + icon('mail') + ' 拆开新来信</button>' : s.progress === 'ready' ? '<button class="secondary mail-float" type="button" data-act="tab" data-id="mail">' + icon('mail') + ' 小林的委托</button>' : '';
-  const activeCats = catIds().filter(id => !staffStatus(id)).length;
   if (lounge) {
-    workspace.innerHTML = '<section class="scene" data-floor="lounge" aria-label="猫舍"><img class="cafe-bg" draggable="false" src="assets/shelter-sunlit.webp" alt=""><div class="sun-glint"></div>' + floorHeader(clock) + target + catIds().map(id => catActor(id, true)).join('') + '<div class="order-dock"><div class="order-copy"><b>猫舍</b><small>' + catIds().filter(id => (!isTrading() || !s.shift.includes(id) || restRequired(id)) && !s.tables.some(table => table.cat === id) && s.away?.cat !== id).length + ' 只在猫舍 · ' + catIds().length + ' / ' + catCapacity() + ' 个栏位</small></div><button type="button" class="secondary" data-act="tab" data-id="adopt">去领养</button>' + (!s.opened && canOpen() ? '<button type="button" class="primary" data-act="open-shop">开门营业</button>' : '<button type="button" class="primary" data-act="tab" data-id="care">照顾猫咪</button>') + '</div></section>';
+    const resting = catIds().filter(id=>(!isTrading() || !s.shift.includes(id) || restRequired(id)) && !s.tables.some(table=>table.cat===id) && s.away?.cat!==id).length;
+    const action = !s.opened && canOpen() ? actionButton('开门营业','open-shop') : actionButton('照顾猫咪','tab','care');
+    workspace.innerHTML = '<section class="scene" data-floor="lounge" aria-label="猫舍"><img class="cafe-bg" draggable="false" src="assets/shelter-sunlit.webp" alt=""><div class="sun-glint"></div>' + floorHeader(clock) + target + catIds().map(id=>catActor(id,true)).join('') + '<div class="order-dock"><div class="order-copy"><b>猫舍</b><small>' + resting + ' 只在猫舍 · ' + catIds().length + ' / ' + catCapacity() + ' 个栏位</small></div>' + actionButton('去领养','tab','adopt','secondary') + action + '</div></section>';
     return;
   }
-  const firstSeat = diningRoom * 4;
-  const furniture = seats.slice(firstSeat,Math.min(firstSeat+4,seatCount())).map((seat,index)=>diningFurniture(seat,firstSeat+index)).join('');
-  const occupied = s.tables.filter(item=>Math.floor(item.seat/4) === diningRoom).sort((a,b) => seats[a.seat].y - seats[b.seat].y).map(item => guestActor(item.guest, item)).join('');
-  const blocked = !isTrading() || availableSeat() < 0 || !activeCats;
-  const action = s.morning ? '<button class="primary" type="button" data-act="morning-board">去做晨间订单</button>' :
-    afterHours() ? '<button class="primary" type="button" data-act="close-shop">结账打烊</button>' :
-    '<button class="secondary" type="button" data-act="next-period">下一时段</button>' + (blocked ? (activeCats ? '' : '<button class="primary" type="button" data-act="tab" data-id="shift">安排排班</button>') : '<button class="primary" type="button" data-act="tab" data-id="order">接待客人</button>');
-  const hint = s.morning ? '完成后领 24 金币，免费开局' : afterHours() ? '结账后进入次日筹备' : s.tables.length + ' / ' + seatCount() + ' 桌在座' + (blocked && !activeCats ? ' · 无空闲猫咪' : '');
-  const title = s.morning ? '开店前备料' : afterHours() ? '今天营业结束' : blocked ? (activeCats ? '客人坐满了' : '猫咪正在忙') : guest.name + '来店了';
-  workspace.innerHTML = '<section class="scene painted-dining" data-floor="dining" aria-label="猫咖餐厅">' + diningBackdrop() + floorHeader(clock) + target + furniture + occupied + catIds().map(id => catActor(id)).join('') + (!blocked && !diningRoom ? guestActor(index) : '') + callout + '<div class="order-dock"><div class="order-copy"><b>' + title + '</b><small>' + hint + '</small></div>' + action + '</div></section>';
+  const firstSeat = diningRoom*4;
+  const furniture = seats.slice(firstSeat,Math.min(firstSeat+4,seatCount())).map((seat,i)=>diningFurniture(seat,firstSeat+i)).join('');
+  const occupied = s.tables.filter(table=>Math.floor(table.seat/4) === diningRoom).sort((a,b)=>seats[a.seat].y-seats[b.seat].y).map(table=>guestActor(table.guest,table)).join('');
+  const problem = orderProblem(index);
+  let title = guest ? guest.name + '来店了' : '等下一位街坊';
+  let hint = guest && problem ? problem : s.tables.length + ' / ' + seatCount() + ' 桌在座';
+  let action = '';
+  if (s.morning) {
+    title = '开店前备料'; hint = '免费完成一单，领取 24 金币'; action = actionButton('做晨间订单','morning-board');
+  } else if (afterHours()) {
+    title = s.tables.length ? '打烊中 · 等客人离座' : '今天营业结束';
+    hint = s.tables.length ? '最后一桌离座后即可结账' : '结账后进入次日筹备';
+    if (!s.tables.length) action = actionButton('结账打烊','close-shop');
+  } else if (guest && !problem) {
+    action = actionButton('接待' + guest.name,'tab','order');
+  } else if (guest && problem.startsWith('原料不足')) {
+    action = actionButton('补充原料','tab','stock');
+  } else if (canSubstitute() && catIds().every(id=>staffStatus(id))) {
+    action = actionButton('安排替班','tab','shift');
+  } else if (!s.tables.length && catIds().some(id=>restRequired(id)) && catIds().every(id=>staffStatus(id))) {
+    action = actionButton('去猫舍照顾','tab','care');
+  }
+  const callout = s.pending ? actionButton('有新明信片','open-mail','','secondary') : actionButton(s.progress === 'ready' ? '有新委托' : '委托信箱','tab','mail','secondary');
+  const quick = '<div class="quick-corner">' + actionButton('备料挑战 · 赚金币<small>' + energyText() + '</small>','tab','pantry','pantry-float') + callout + '</div>';
+  workspace.innerHTML = '<section class="scene painted-dining service-scene" data-floor="dining" aria-label="猫咖餐厅">' + diningBackdrop() + floorHeader(clock) + target + (isTrading() ? schedulePanel() : '') + furniture + occupied + catIds().map(id=>catActor(id)).join('') + (guest && !diningRoom ? guestActor(index) : '') + quick + '<div class="service-bottom">' + catRail() + '<div class="order-dock"><div class="order-copy"><b>' + title + '</b><small>' + hint + '</small></div>' + action + '</div></div></section>';
 }
 function showTable(index) {
-  const table = s.tables.find(item => item.seat === index);
+  const table = s.tables.find(item=>item.seat===index);
   if (!table) return;
-  dialog.innerHTML = '<div class="dialog-top"><h2 class="heading" id="dialog-title">' + (index + 1) + '号桌 · ' + guests[table.guest].name + '</h2><button type="button" class="close" data-act="close" aria-label="关闭">×</button></div><p class="copy">' + cats[table.cat].name + '正在陪伴。还可停留 ' + (table.until - s.turn) + ' 个营业时段。</p><button class="secondary wide" type="button" data-act="close-table" data-id="' + index + '">结账并让猫咪休息</button>';
+  dialog.innerHTML = '<div class="dialog-top"><h2 class="heading" id="dialog-title">' + (index+1) + '号桌 · ' + guests[table.guest].name + '</h2><button type="button" class="close" data-act="close" aria-label="关闭">×</button></div><p class="copy">' + cats[table.cat].name + '正在陪伴，约 ' + tableTimer(table) + '后离座。</p>';
   dialog.setAttribute('aria-labelledby','dialog-title');
   dialog.showModal();
 }
-
 function renderOrder() {
-  const index = s.guest % guests.length;
+  const index = orderGuest;
   const guest = guests[index];
-  screen('接待客人', '01 / 客人点单', '<div class="order-guest"><img class="guest-avatar" src="' + peopleAnimation[index].portrait + '" alt=""><div><b>' + guest.name + ' · 想喝' + guest.drink + '</b><p>「' + guest.hint + '」</p></div></div><section class="panel"><h2 class="heading">挑一只猫陪伴</h2><p class="copy">根据客人的心情和猫咪的性格来安排。</p><div class="choice-list">' + matchList() + '</div><button class="primary wide" type="button" data-act="to-brew" ' + (!selected ? 'disabled' : '') + '>选好猫咪，去吧台</button></section>');
+  if (!guest || !waitingCount() || Math.floor(s.clockMs/periodMs) !== orderPeriod) { go('shop'); return; }
+  const coffee = guestCoffee(guest);
+  const dessert = guestDessert(guest);
+  const menu = coffeeMenu[coffee].name + (dessert ? ' · ' + pastryMenu[dessert].name : '');
+  const problem = orderProblem(index);
+  screen('接待客人','选猫，再翻牌做订单','<div class="order-guest"><img class="guest-avatar" src="' + peopleAnimation[index].portrait + '" alt=""><div><b>' + guest.name + ' · ' + menu + '</b><p>「' + guest.hint + '」</p></div></div><section class="panel"><h2 class="heading">挑一只猫陪伴</h2><p class="copy">翻牌前会预留桌位和猫咪。完成订单后客人才入座。</p><div class="choice-list">' + matchList() + '</div>' + (problem ? '<p class="notice">' + problem + '</p>' : '') + '<button class="primary wide" type="button" data-act="order-board" ' + (!selected || problem ? 'disabled' : '') + '>去翻牌 · ' + (orderCost() ? orderCost() + ' 点体力' : '新手免费') + '</button></section>');
 }
 const coffeeMenu = {
-  latte: { name:'原味拿铁', tasks:['beans','milk','heat','pitcher'], stock:['beans','milk'] },
-  americano: { name:'美式咖啡', tasks:['beans','water'], stock:['beans'] },
-  cappuccino: { name:'卡布奇诺', tasks:['beans','milk','heat','foam'], stock:['beans','milk'] },
-  honey: { name:'蜂蜜拿铁', tasks:['beans','milk','heat','honey','pitcher'], stock:['beans','milk','honey'], recipe:true }
+  latte: { name:'原味拿铁', stock:['beans','milk'] },
+  americano: { name:'美式咖啡', stock:['beans'] },
+  cappuccino: { name:'卡布奇诺', stock:['beans','milk'] },
+  honey: { name:'蜂蜜拿铁', stock:['beans','milk','honey'], recipe:true }
 };
-const ingredientNames = { beans:'咖啡豆', milk:'牛奶', honey:'蜂蜜', pitcher:'奶缸', water:'热水', foam:'绵密奶泡' };
 const pastryMenu = {
   sponge: { name:'香草戚风', price:8, level:1 },
   honeycake: { name:'蜂蜜磅蛋糕', price:12, level:2, honey:true }
@@ -316,76 +413,6 @@ const crew = {
   baker: { name:'小满', title:'烘焙师', cost:65, upgrade:45, description:'烤蛋糕供搭售。2 级解锁蜂蜜磅蛋糕，培训后每炉产量增加。' },
   barista: { name:'阿青', title:'咖啡师', cost:90, upgrade:60, description:'协助吧台出杯。每级让每杯咖啡多赚 2 金币。' }
 };
-let pastry = '';
-function coffeeUnlocked(id) { return !coffeeMenu[id].recipe || s.menu; }
-function brewTasks() { return coffeeMenu[drink].tasks; }
-function brewTask() { return brewTasks()[brewStep]; }
-function canBrew() { return coffeeUnlocked(drink) && coffeeMenu[drink].stock.every(key=>s[key] > 0); }
-function resetBrew() {
-  brewStep = 0;
-  ingredientSelected = '';
-  heatStart = null;
-  milkTemperature = null;
-}
-function ingredientIcon(id) {
-  const art = {
-    water:'<path fill="#567f88" d="M11 3h3v3h2v4h3v6h-2v4H7v-4H5v-6h3V6h3z"/><path fill="#cceefa" d="M11 7h3v4h3v5h-2v2H8v-2H7v-5h4z"/>',
-    foam:'<path fill="#ba9a7c" d="M3 14h4v-4h3V7h5v3h4v4h2v6H3z"/><path fill="#fff3d8" d="M5 15h4v-4h3V9h2v3h4v3h1v3H5z"/>',
-    beans:'<path fill="#583525" d="M5 7h7V5h5v3h4v8h-3v3h-6v2H7v-3H4V9z"/><path fill="#ad6b43" d="M6 9h4V7h5v3h-2v4h-3v4H7v-2H6zM16 11h3v4h-3v3h-4v-2h3z"/>',
-    milk:'<path fill="#5e766d" d="M7 3h10v3l3 5v11H5V11l2-5z"/><path fill="#ffefcb" d="M8 4h8v3l2 4v9H7v-9l1-4z"/><path fill="#84a496" d="M7 12h11v6H7zM9 7h6v2H9z"/>',
-    honey:'<path fill="#a36c35" d="M6 4h13v5h-2l3 3v8h-3v2H8v-2H5v-8l3-3H6z"/><path fill="#eab055" d="M8 6h9v2H8zm2 5h5v2h3v6H7v-6h3z"/><path fill="#ffeb97" d="M9 14h6v3H9z"/>',
-    pitcher:'<path fill="#60524a" d="M3 6h16v4h3v7h-4v4H6v-3H4V9H3z"/><path fill="#a6ada5" d="M6 8h11v11H7v-3H6zm12 4h2v3h-2z"/><path fill="#e7e7ce" d="M7 8h9v2H7zM8 11h2v6H8z"/>'
-  };
-  return '<svg viewBox="0 0 24 24" aria-hidden="true" shape-rendering="crispEdges">' + art[id] + '</svg>';
-}
-function brewArt(task) {
-  const machine = '<path fill="#674b3a" d="M21 27h87v61H21z"/><path fill="#78917a" d="M23 28h83v57H23z"/><path fill="#a7b393" d="M23 28h83v13H23z"/><path fill="#344a40" d="M31 47h66v31H31z"/><path fill="#d8b180" d="M34 32h19v5H34zm47-1h5v6h-5zm9 0h5v6h-5z"/><path fill="#e4c79a" d="M22 81h85v5H22z"/>';
-  const cup = '<path fill="#704b39" d="M46 48h34v7h10v15H79v9H54v-5h-5z"/><path fill="#fff0c7" d="M48 51h30v19h-4v6H55v-5h-4zm30 7h9v9h-9v-3h5v-3h-5z"/><path fill="#915936" d="M50 51h25v6H50z"/>';
-  const jug = '<path fill="#62534a" d="M43 49h32l6 7h9v16H79v7H51v-6h-5z"/><path fill="#b7bcb2" d="M46 52h28l4 6v17H53v-5h-5zm34 8h7v9h-7v-3h4v-3h-4z"/><path fill="#f3e1ba" d="M48 53h25v7H48z"/>';
-  const steam = '<path class="steam" fill="#fff0ce" d="M56 27h3v7h3v7h-3v-4h-3zm13-5h3v10h3v7h-3v-4h-3z"/>';
-  const image = task === 'beans' ? machine + '<path fill="#e9c493" d="M48 10h34v12H48z"/><path fill="#64412f" d="M50 14h30v8H50z"/>' : (task === 'milk' || task === 'heat') ? machine + jug + (heatStart !== null ? steam : '') : cup + (task === 'pitcher' ? '<path fill="#fff0c7" d="M61 52h5v2h5v2h-5v2h-5v-2h-5v-2h5z"/>' : !task ? steam + '<path fill="#fff0c7" d="M61 52h5v2h5v2h-5v2h-5v-2h-5v-2h5z"/>' : '');
-  return '<svg viewBox="0 0 128 92" aria-hidden="true" shape-rendering="crispEdges">' + image + '</svg>';
-}
-function brewTemperature(now) {
-  if (heatStart === null) return milkTemperature ?? 42;
-  const progress = ((now - heatStart) / 29) % 72;
-  return Math.round(42 + Math.min(progress, 72 - progress));
-}
-function renderBrew() {
-  const guest = guests[s.guest % guests.length];
-  const tasks = brewTasks();
-  const task = brewTask();
-  const labels = { beans:'把咖啡豆拖到研磨机', milk:'把牛奶拖到奶缸', heat:'把牛奶加热到 58–66°C', honey:'把蜂蜜拖入杯中', pitcher:'把奶缸拖到咖啡杯', water:'加热水，调成美式', foam:'把厚奶泡轻轻盖在咖啡上' };
-  const available = tasks.filter((id,index)=>id !== 'heat' && index >= brewStep);
-  const ingredients = task && task !== 'heat' ? '<div class="ingredient-tray" aria-label="配料">' + available.map(id => '<button type="button" class="ingredient ' + (ingredientSelected === id ? 'picked' : '') + '" data-act="ingredient" data-id="' + id + '" aria-pressed="' + (ingredientSelected === id) + '">' + ingredientIcon(id) + '<span>' + ingredientNames[id] + '</span></button>').join('') + '</div>' : '';
-  const gauge = task === 'heat' ? '<div class="temperature"><div class="line-item"><b id="temp-value">' + brewTemperature(performance.now()) + '°C</b><span>绿色区间 58–66°C</span></div><div class="temp-track" aria-hidden="true"><i id="temp-needle"></i></div><button class="primary wide" type="button" data-act="heat">' + (heatStart === null ? '启动蒸汽' : '停止加热') + '</button></div>' : '';
-  const stage = '<div class="brew-visual ' + (task && task !== 'heat' ? 'drop-ready' : '') + '">' + (task && task !== 'heat' ? '<button class="brew-drop" type="button" data-act="drop" data-brew-drop>' + brewArt(task) + '<span>' + labels[task] + '</span></button>' : brewArt(task)) + '</div>';
-  const status = milkTemperature !== null ? '<p class="copy">奶温 ' + milkTemperature + '°C · ' + (milkTemperature >= 58 && milkTemperature <= 66 ? '奶泡细腻，额外 +3 金币' : '这杯可以照常出杯') + '</p>' : '';
-  const desserts = Object.entries(pastryMenu).filter(([id])=>s.pastries[id] > 0);
-  const dessertSelect = desserts.length ? '<div class="line-item"><label for="pastry">搭配糕点</label><select id="pastry"><option value="">只上咖啡</option>' + desserts.map(([id,item])=>'<option value="' + id + '" ' + (pastry === id ? 'selected' : '') + '>' + item.name + ' · +' + item.price + ' 金币</option>').join('') + '</select></div>' : '';
-  const coffeeOptions = Object.entries(coffeeMenu).filter(([id])=>coffeeUnlocked(id)).map(([id,item])=>'<option value="' + id + '" ' + (drink === id ? 'selected' : '') + '>' + item.name + '</option>').join('');
-  const instructions = task === 'heat' ? '启动蒸汽，指针进入绿色区间时停下。' : task ? '拖动配料到目标上，也可以点选配料后再点目标。' : '做好了。现在可以给客人上咖啡。';
-  screen('吧台做咖啡', '02 / 制作饮品', '<section class="panel"><div class="line-item"><label for="drink">这一单的饮品</label><select id="drink">' + coffeeOptions + '</select></div>' + dessertSelect + '<p class="copy">' + guest.name + '点了' + guest.drink + '，由' + cats[selected].name + '陪伴。</p><div class="steps brew-progress" aria-label="制作进度">' + tasks.map((id, i) => '<span class="' + (i < brewStep ? 'done' : i === brewStep ? 'current' : '') + '">' + (i < brewStep ? '✓' : i + 1) + ' ' + ({beans:'研磨',milk:'加奶',heat:'控温',honey:'调味',pitcher:'融合',water:'注水',foam:'铺奶泡'})[id] + '</span>').join('') + '</div>' + (canBrew() ? stage + ingredients + gauge + '<p class="copy">' + instructions + '</p>' + status + (!task ? '<button class="primary wide" type="button" data-act="serve">上咖啡并安排陪伴</button>' : '') : '<p class="notice">库存：豆 ' + s.beans + ' · 奶 ' + s.milk + ' · 蜂蜜 ' + s.honey + '</p><button class="secondary wide" type="button" data-act="tab" data-id="stock">食材不足，去店务补货</button>') + '</section>', 'order');
-  if (heatStart !== null) requestAnimationFrame(updateHeat);
-}
-function updateHeat(now) {
-  if (tab !== 'brew' || heatStart === null) return;
-  const value = brewTemperature(now);
-  const needle = document.querySelector('#temp-needle');
-  if (!needle) return;
-  needle.style.left = (value - 42) / 36 * 100 + '%';
-  document.querySelector('#temp-value').textContent = value + '°C';
-  requestAnimationFrame(updateHeat);
-}
-function addIngredient(id) {
-  if (tab !== 'brew' || !canBrew() || !id || brewTask() === 'heat' || !brewTask()) return;
-  if (id !== brewTask()) { note('还没到用' + ingredientNames[id] + '的这一步。'); return; }
-  ingredientSelected = '';
-  brewStep += 1;
-  refresh();
-  workspace.querySelector('.ingredient,[data-act="heat"],[data-act="serve"]')?.focus({preventScroll:true});
-}
-
 const themes = {
   spring: {name:'晴窗薄荷', description:'薄荷绿窗框、奶油墙和浅橡木', colors:['#94bd9f','#f9f3df','#dcb58e']},
   breeze: {name:'海盐午后', description:'浅蓝窗框、云白墙和蜜桃木', colors:['#91b8cb','#f5f8fa','#e9bda9']},
@@ -404,7 +431,7 @@ function renderRenovation() {
   const project = diningProject();
   const progress = project ? '<p class="copy">' + project.detail + '</p><div class="meter" role="progressbar" aria-label="金币进度" aria-valuemax="' + project.cost + '" aria-valuenow="' + Math.min(s.coins,project.cost) + '"><i style="width:' + Math.min(100,s.coins/project.cost*100) + '%"></i></div><p class="copy">现有 ' + s.coins + ' 金币 · ' + (s.coins >= project.cost ? '金币已攒够' : '还差 ' + (project.cost-s.coins) + ' 金币') + '</p><button class="primary wide" type="button" data-act="buy-dining" data-id="' + (s.diningLevel+1) + '" ' + (!s.opened || s.coins < project.cost ? 'disabled' : '') + '>' + (s.opened ? project.name + ' · ' + project.cost + ' 金币' : '开店后可购买') + '</button>' : '<p class="copy">主厅和阳光间都已布置完成。</p>';
   const stages = diningStages.map((stage,index)=>'<li><span>' + stage.name + '<small>' + stage.count + ' 张营业桌' + (stage.cost ? ' · ' + stage.cost + ' 金币' : '') + '</small></span><b>' + (index <= s.diningLevel ? '已完成' : index === s.diningLevel+1 ? '当前目标' : '待解锁') + '</b></li>').join('');
-  screen('店面升级','添桌椅，慢慢把小店做大','<section class="panel"><p class="kicker">当前店面 · ' + seatCount() + ' 张桌</p><h2 class="heading">' + (project ? project.name : '绿植阳光房已完成') + '</h2>' + progress + '</section><section class="panel"><h2 class="heading">扩店计划</h2><ol class="upgrade-stages">' + stages + '</ol></section>');
+  screen('店面升级','添桌椅，慢慢把小店做大','<section class="panel"><p class="kicker">当前店面 · ' + seatCount() + ' 张桌</p><h2 class="heading">' + (project ? project.name : '绿植阳光房已完成') + '</h2>' + progress + (project && s.coins < project.cost ? actionButton('去备料挑战 · 赚金币','tab','pantry','secondary wide') : '') + '</section><section class="panel"><h2 class="heading">扩店计划</h2><ol class="upgrade-stages">' + stages + '</ol></section>');
 }
 function themeSettings() {
   return '<section class="panel"><h2 class="heading">店面配色</h2><p class="copy">换一套光线和颜色，随时切回。</p><div class="theme-list">' + Object.entries(themes).map(([id,theme])=>'<button class="theme-choice" type="button" data-act="theme" data-id="' + id + '" aria-pressed="' + (s.theme === id) + '"><span aria-hidden="true">' + theme.colors.map(color=>'<i style="background:' + color + '"></i>').join('') + '</span><b>' + theme.name + '</b><small>' + theme.description + '</small></button>').join('') + '</div></section>';
@@ -443,7 +470,7 @@ function renderTeam() {
   screen('店员与烘焙','招聘 · 培训 · 搭售糕点','<section class="panel"><div class="line-item"><h2 class="heading">街坊招聘</h2><b>' + s.coins + ' 金币</b></div>' + (unlocked ? '' : '<p class="notice">开门并添置第 3 张桌后解锁店员。</p>') + staff + '</section><section class="panel"><h2 class="heading">烘焙备货</h2><p class="copy">每炉用 1 面粉、1 牛奶，磅蛋糕还要 1 蜂蜜。做好后可在吧台随咖啡搭售。</p><p class="copy">面粉 ' + s.flour + ' · 牛奶 ' + s.milk + ' · 蜂蜜 ' + s.honey + '</p>' + bakery + '</section>','stock');
 }
 function renderStock() {
-  screen('店务', '升级 · 库存 · 装饰', '<button class="primary wide" style="margin:0 0 10px" type="button" data-act="tab" data-id="shift">营业排班</button><section class="panel"><h2 class="heading">店员与烘焙</h2><p class="copy">添置第三张桌后，可以招聘烘焙师和咖啡师。</p><button class="secondary wide" type="button" data-act="tab" data-id="team">查看店员与烘焙</button></section><section class="panel"><h2 class="heading">店面升级</h2><p class="copy">目前可接待 ' + seatCount() + ' 桌' + (diningProject() ? ' · 下一步：' + diningProject().name : '') + '</p><button class="primary wide" type="button" data-act="tab" data-id="renovate">查看扩店计划</button></section><section class="panel"><h2 class="heading">吧台备货</h2><p class="copy">金币 ' + s.coins + ' · 营业积分 ' + s.points + '</p><div class="line-item"><span>豆 ' + s.beans + ' · 奶 ' + s.milk + ' · 蜂蜜 ' + s.honey + ' · 面粉 ' + s.flour + '</span><button type="button" class="secondary" data-act="restock" ' + (s.coins < 10 ? 'disabled' : '') + '>补货 · 10 金币</button></div><div class="line-item"><span>蜂蜜拿铁配方</span><button type="button" class="secondary" data-act="recipe" ' + (s.menu || s.points < 3 ? 'disabled' : '') + '>' + (s.menu ? '已解锁' : '兑换 · 3 积分') + '</button></div></section><section class="panel"><h2 class="heading">猫窝</h2><p class="copy">在店 ' + catIds().length + ' 只 · 可照顾 ' + catCapacity() + ' 只</p><button type="button" class="secondary wide" data-act="expand" ' + (catCapacity() >= Object.keys(cats).length || s.coins < expansionCost() ? 'disabled' : '') + '>' + (catCapacity() >= Object.keys(cats).length ? '已扩到最大' : '扩建猫窝 · ' + expansionCost() + ' 金币') + '</button><button type="button" class="secondary wide" data-act="tab" data-id="adopt">打开领养所</button></section>' + themeSettings() + '<section class="panel"><p class="copy">试玩进度保存在当前浏览器。</p><button class="secondary wide" type="button" data-act="read-story">重看开店故事</button>' + (s.opened && afterHours() ? '<button class="secondary wide" type="button" data-act="close-shop">结账打烊</button>' : '') + '<button class="secondary wide" type="button" data-act="ask-reset">重新开始</button></section>');
+  screen('店务', '升级 · 库存 · 装饰', '<button class="primary wide" style="margin:0 0 10px" type="button" data-act="tab" data-id="shift">营业排班</button><section class="panel"><h2 class="heading">店员与烘焙</h2><p class="copy">添置第三张桌后，可以招聘烘焙师和咖啡师。</p><button class="secondary wide" type="button" data-act="tab" data-id="team">查看店员与烘焙</button></section><section class="panel"><h2 class="heading">店面升级</h2><p class="copy">目前可接待 ' + seatCount() + ' 桌' + (diningProject() ? ' · 下一步：' + diningProject().name : '') + '</p><button class="primary wide" type="button" data-act="tab" data-id="renovate">查看扩店计划</button></section><section class="panel"><h2 class="heading">吧台备货</h2><p class="copy">金币 ' + s.coins + ' · 营业积分 ' + s.points + '</p><div class="line-item"><span>豆 ' + s.beans + ' · 奶 ' + s.milk + ' · 蜂蜜 ' + s.honey + ' · 面粉 ' + s.flour + '</span><button type="button" class="secondary" data-act="restock" ' + (s.coins < 10 ? 'disabled' : '') + '>补货 · 10 金币</button></div><div class="line-item"><span>蜂蜜拿铁配方</span><button type="button" class="secondary" data-act="recipe" ' + (s.menu || s.points < 3 ? 'disabled' : '') + '>' + (s.menu ? '已解锁' : '兑换 · 3 积分') + '</button></div></section><section class="panel"><h2 class="heading">猫窝</h2><p class="copy">在店 ' + catIds().length + ' 只 · 可照顾 ' + catCapacity() + ' 只</p><button type="button" class="secondary wide" data-act="expand" ' + (catCapacity() >= Object.keys(cats).length || s.coins < expansionCost() ? 'disabled' : '') + '>' + (catCapacity() >= Object.keys(cats).length ? '已扩到最大' : '扩建猫窝 · ' + expansionCost() + ' 金币') + '</button><button type="button" class="secondary wide" data-act="tab" data-id="adopt">打开领养所</button></section>' + themeSettings() + '<section class="panel"><p class="copy">试玩进度保存在当前浏览器。</p><button class="secondary wide" type="button" data-act="read-story">重看开店故事</button>' + (s.opened && afterHours() && !s.tables.length ? '<button class="secondary wide" type="button" data-act="close-shop">结账打烊</button>' : '') + '<button class="secondary wide" type="button" data-act="ask-reset">重新开始</button></section>');
 }
 function remaining() { return Math.max(0, Math.ceil((s.deadline - Date.now()) / 1000)); }
 function timerText() { return '00:' + String(remaining()).padStart(2, '0'); }
@@ -454,7 +481,7 @@ function renderMission() {
   if (s.progress === 'ready' || s.progress === 'done') content += '<p class="copy">用 30 秒看看客厅的细节。换一只猫，可能收到另一张照片。</p><button type="button" class="primary wide" data-act="start">' + (s.progress === 'done' ? '再接一次委托' : '接下委托 · 开始找线索') + '</button>';
   if (s.progress === 'finding') content += '<button type="button" class="primary wide" data-act="tab" data-id="clues">继续找线索</button>';
   if (s.progress === 'choosing') content += '<button type="button" class="primary wide" data-act="tab" data-id="dispatch">继续选猫</button>';
-  if (s.away) content += '<p class="notice">' + cats[s.away.cat].name + '正在小林家陪伴。下一轮营业后回来。</p><div class="actions"><button type="button" class="secondary" data-act="tab" data-id="shop">回店继续接待</button><button type="button" class="primary" data-act="finish-turn">结束本轮营业</button></div>';
+  if (s.progress === 'away') content += '<p class="notice">猫咪正在上门陪伴，预计 <b data-visit-timer>' + secLeft(s.away.returnAt-Date.now()) + ' 秒</b>后回来，来信会自动送达。</p>';
   if (s.pending) content += '<p class="notice">' + cats[s.pending.cat].name + '已经回店。小林的妈妈寄来了一张明信片。</p><button type="button" class="primary wide" data-act="open-mail">拆开信封</button>';
   screen('上门委托', '街坊来信 / NO. 01', '<section class="panel"><h2 class="heading">窗边的陪伴</h2><div style="margin-top:10px">' + content + '</div></section>');
 }
@@ -741,54 +768,13 @@ function postcardFile(card, picture) {
   return exportCanvas.toDataURL('image/png');
 }
 
-let drag = null;
 let swipe = null;
-let ignoreIngredientClick = 0;
 let ignoreSwipeClick = 0;
 workspace.addEventListener('pointerdown', event => {
   if (!event.isPrimary || event.button !== 0) return;
-  const source = event.target.closest('.ingredient,.merge-tile:not(.tile-empty)');
-  if (source && (tab === 'brew' || (tab === 'board' && s.puzzle?.status === 'playing'))) {
-    drag = { pointer:event.pointerId, source, x:event.clientX, y:event.clientY, ghost:null };
-    source.setPointerCapture(event.pointerId);
-    return;
-  }
-  if (event.target.closest('[data-floor]')) swipe = { pointer:event.pointerId, x:event.clientX, y:event.clientY };
+  if (event.target.closest('[data-floor]') && !event.target.closest('.cat-rail')) swipe = { pointer:event.pointerId, x:event.clientX, y:event.clientY };
 });
-workspace.addEventListener('pointermove', event => {
-  if (drag?.pointer !== event.pointerId) return;
-  if (!drag.ghost && Math.hypot(event.clientX-drag.x,event.clientY-drag.y) < 7) return;
-  if (!drag.ghost) {
-    drag.ghost = drag.source.cloneNode(true);
-    drag.ghost.classList.add('ingredient-ghost');
-    drag.ghost.style.width = drag.source.offsetWidth + 'px';
-    drag.ghost.removeAttribute('data-act');
-    drag.ghost.setAttribute('aria-hidden','true');
-    drag.ghost.tabIndex = -1;
-    document.body.append(drag.ghost);
-  }
-  drag.ghost.style.left = event.clientX + 'px';
-  drag.ghost.style.top = event.clientY + 'px';
-  const target = document.elementFromPoint(event.clientX,event.clientY)?.closest('[data-brew-drop]');
-  workspace.querySelector('[data-brew-drop]')?.classList.toggle('over',!!target);
-});
-function clearDrag() {
-  drag.ghost?.remove();
-  workspace.querySelector('[data-brew-drop]')?.classList.remove('over');
-  drag = null;
-}
 workspace.addEventListener('pointerup', event => {
-  if (drag?.pointer === event.pointerId) {
-    const { ghost, source } = drag;
-    const over = document.elementFromPoint(event.clientX,event.clientY)?.closest('[data-brew-drop],.merge-tile');
-    clearDrag();
-    if (ghost) {
-      ignoreIngredientClick = performance.now() + 360;
-      if (over?.matches('[data-brew-drop]')) addIngredient(source.dataset.id);
-      if (tab === 'board' && s.puzzle?.status === 'playing' && over?.matches('.merge-tile')) mergeTiles(Number(source.dataset.id),Number(over.dataset.id));
-    }
-    return;
-  }
   if (swipe?.pointer !== event.pointerId) return;
   const dx = event.clientX-swipe.x, dy = event.clientY-swipe.y;
   swipe = null;
@@ -804,11 +790,7 @@ workspace.addEventListener('pointerup', event => {
   refresh();
 });
 workspace.addEventListener('pointercancel', event => {
-  if (drag?.pointer === event.pointerId) clearDrag();
   if (swipe?.pointer === event.pointerId) swipe = null;
-});
-workspace.addEventListener('lostpointercapture', event => {
-  if (drag?.pointer === event.pointerId) clearDrag();
 });
 workspace.addEventListener('click', event => {
   if (performance.now() >= ignoreSwipeClick) return;
@@ -816,21 +798,17 @@ workspace.addEventListener('click', event => {
   event.stopPropagation();
 }, true);
 
-document.addEventListener('change', event => {
-  if (event.target.id === 'pastry') { pastry = event.target.value; return; }
-  if (event.target.id !== 'drink' || !Object.hasOwn(coffeeMenu,event.target.value) || !coffeeUnlocked(event.target.value)) return;
-  drink = event.target.value;
-  resetBrew();
-  refresh();
-  document.querySelector('#drink')?.focus();
-});
 document.addEventListener('click', event => {
   const button = event.target.closest('button[data-act]');
   if (!button || button.disabled) return;
   const { act, id } = button.dataset;
   switch (act) {
     case 'tab':
-      if (id === 'order' && (!isTrading() || availableSeat() < 0 || catIds().every(cat=>staffStatus(cat)))) { note('等有空桌和空闲的猫咪再接单。'); return; }
+      if (boardActive()) return;
+      if (id === 'order') {
+        const problem = orderProblem(nextGuest());
+        if (problem) { note(problem); return; }
+      }
       go(id); break;
     case 'floor':
       lounge = id === 'lounge';
@@ -854,77 +832,31 @@ document.addEventListener('click', event => {
       save(); go('shop'); note(project.name + '完成 · 可接待 ' + project.count + ' 桌'); break;
     }
     case 'table': showTable(Number(id)); break;
-    case 'close-table':
-      s.tables = s.tables.filter(table => table.seat !== Number(id));
-      joiningSeat = null; dialog.close(); update(); break;
     case 'next-period':
-      joiningSeat = null; advancePeriod(); update(); break;
+      if (canSkipPeriod()) { advanceClock(periodMs-periodElapsed()); lastClockTick = performance.now(); update(); }
+      break;
     case 'close-shop': nextMorning(); break;
     case 'morning-board':
-      if (s.morning) startPantry(s.puzzle?.status === 'playing' ? s.puzzle.level : 0);
+      startPantry(0,true);
       break;
+    case 'inspect-cat': {
+      if (!catIds().includes(id)) return;
+      const table = s.tables.find(item=>item.cat===id);
+      if (table) showTable(table.seat);
+      else { careCat = id; go('care'); }
+      break;
+    }
     case 'pet':
       if (lounge) { careCat = id; go('care'); }
       else note(cats[id].name + ' · ' + cats[id].traits);
       break;
-    case 'to-brew':
-      if (!isTrading() || !selected || staffStatus(selected) || availableSeat() < 0) return;
-      const requested = guests[s.guest % guests.length].drink;
-      const exactDrink = Object.keys(coffeeMenu).find(key=>coffeeMenu[key].name === requested && coffeeUnlocked(key));
-      drink = exactDrink ?? 'latte';
-      pastry = '';
-      resetBrew(); go('brew'); break;
-    case 'ingredient':
-      if (performance.now() < ignoreIngredientClick) return;
-      ingredientSelected = id; refresh();
-      workspace.querySelector('[data-brew-drop]')?.focus({preventScroll:true});
-      break;
-    case 'drop': addIngredient(ingredientSelected); break;
-    case 'heat':
-      if (tab !== 'brew' || brewTask() !== 'heat') return;
-      if (heatStart === null) heatStart = performance.now();
-      else {
-        milkTemperature = brewTemperature(performance.now());
-        heatStart = null; brewStep += 1;
-      }
-      refresh();
-      workspace.querySelector('[data-act="heat"],.ingredient')?.focus({preventScroll:true});
-      break;
+    case 'order-board': startOrder(); break;
     case 'cat':
       if (!catIds().includes(id) || staffStatus(id,tab !== 'dispatch')) return;
       selected = id;
       refresh();
       document.querySelector('[data-act="cat"][data-id="' + id + '"]')?.focus();
       break;
-    case 'serve': {
-      if (!isTrading() || tab !== 'brew' || brewStep !== brewTasks().length || !selected || staffStatus(selected) || !canBrew()) return;
-      const seat = availableSeat();
-      if (seat < 0) return;
-      const guest = guests[s.guest % guests.length];
-      const sought = { sesame:'安静', pudding:'爱玩', chestnut:'好奇' }[guest.cat];
-      const match = catTags(cats[selected]).includes(sought);
-      const recipeMatch = coffeeMenu[drink].name === guest.drink;
-      const quality = milkTemperature >= 58 && milkTemperature <= 66;
-      const dessert = Object.hasOwn(pastryMenu,pastry) && s.pastries[pastry] > 0 ? pastryMenu[pastry] : null;
-      const gain = 10 + (match ? 6 : 0) + (recipeMatch ? 2 : 0) + (quality ? 3 : 0) + (careState(selected).bond >= 2 ? 2 : 0) + (s.workers.barista || 0)*2 + (dessert?.price || 0);
-      const points = match ? 2 : 1;
-      for (const key of coffeeMenu[drink].stock) s[key] -= 1;
-      if (dessert) s.pastries[pastry] -= 1;
-      s.coins += gain;
-      s.points += points;
-      s.served += 1;
-      const guestIndex = s.guest % guests.length;
-      s.guest += 1;
-      if (s.progress === 'locked') s.progress = 'ready';
-      s.tables.push({ seat, guest: guestIndex, cat: selected, until: s.turn + guests[guestIndex].stay });
-      diningRoom = Math.floor(seat / 4);
-      consumeWork(selected);
-      joiningSeat = seat;
-      const name = cats[selected].name;
-      resetBrew(); save(); go('shop');
-      note((dessert ? '加售' + dessert.name + ' · ' : '') + name + (match ? '和客人很投缘' : '陪客人坐了一会儿') + ' · +' + gain + ' 金币 · +' + points + ' 积分');
-      break;
-    }
     case 'hire': case 'train': case 'bake': staffAction(act,id); break;
     case 'restock':
       if (s.coins < 10) return;
@@ -953,13 +885,8 @@ document.addEventListener('click', event => {
       s.progress = 'choosing'; save(); go('dispatch'); break;
     case 'dispatch':
       if (s.progress !== 'choosing' || !selected || s.away || staffStatus(selected,false)) return;
-      s.away = { cat: selected, clues: s.found.length, until: s.turn + 1 };
+      s.away = { cat: selected, clues: s.found.length, returnAt: Date.now()+hourMs };
       s.progress = 'away'; save(); go('mail'); break;
-    case 'finish-turn':
-      if (!s.away) return;
-      joiningSeat = null;
-      if (isTrading()) advancePeriod(); else advance();
-      update(); break;
     case 'open-mail':
       if (s.pending) go('letter');
       break;
@@ -977,48 +904,81 @@ document.addEventListener('click', event => {
       dialog.setAttribute('aria-labelledby', 'dialog-title');
       dialog.showModal(); break;
     case 'reset':
-      s = fresh(); careCat = 'sesame'; mergeSelected = null; drink = 'latte'; resetBrew(); lounge = false; joiningSeat = null; dialog.close(); storyPage = 0; diningRoom = 0; save(); go('story'); break;
+      s = fresh(); lastClockTick = performance.now(); careCat = 'sesame'; lounge = false; joiningSeat = null; dialog.close(); storyPage = 0; diningRoom = 0; save(); go('story'); break;
     case 'draw-cat': pullCat(); break;
     case 'first-board': startPantry(0); break;
     case 'open-shop':
-      if (!s.opened && canOpen()) { s.opened = true; s.shift = catIds().filter(id=>!staffStatus(id,false)).slice(0,3); lounge = false; diningRoom = 0; update(); note('今天开始营业！'); }
+      if (!s.opened && canOpen()) { s.opened = true; lastClockTick = performance.now(); s.shift = catIds().filter(id=>!staffStatus(id,false)).slice(0,3); lounge = false; diningRoom = 0; update(); note('今天开始营业！'); }
       break;
     case 'shift-cat': shiftAction(id); break;
     case 'adopt': adoptCat(id); break;
     case 'care-cat': careCat = id; refresh(); break;
     case 'buy-rest': case 'use-rest': careAction(act,id); break;
     case 'level': startPantry(Number(id)); break;
-    case 'tile': case 'spawn': case 'deliver': case 'discard': case 'abandon':
-      if (act !== 'tile' || performance.now() >= ignoreIngredientClick) pantryAction(act,id);
-      break;
-    case 'confirm-abandon':
-      if (s.puzzle?.status === 'playing') { s.puzzle = null; mergeSelected = null; dialog.close(); save(); go('pantry'); }
-      break;
+    case 'flip': flipCard(Number(id)); break;
+    case 'submit-board': submitBoard(); break;
+    case 'abandon': abandonBoard(); break;
+    case 'confirm-abandon': loseBoard(); break;
     case 'close': dialog.close(); break;
   }
 });
-function tick() {
-  if (finishRecoveries() && ['shop','care','shift','order','dispatch'].includes(tab)) refresh();
-  const countdown = document.querySelector('#rest-countdown');
-  if (countdown) countdown.textContent = recoveryTime(careState(careCat));
-  if (s.progress !== 'finding') return;
-  if (!remaining()) {
-    s.progress = 'choosing';
-    save();
-    if (tab === 'clues') { go('dispatch'); note('找线索时间结束，可以选猫了。'); }
-    else if (tab === 'mail') render();
-  } else {
-    const timer = document.querySelector('#timer');
-    if (timer) timer.textContent = timerText();
-  }
+function paintTimers() {
+  const write = (selector,value,root=document) => {
+    for (const node of root.querySelectorAll(selector)) node.textContent = value;
+  };
+  if (isTrading()) write('[data-clock]','营业时段 ' + clockText());
+  const progress = document.querySelector('[data-period-progress]');
+  if (progress) progress.value = periodElapsed();
+  write('[data-period-timer]',secLeft(periodMs-periodElapsed()) + ' 秒');
+  const nextArrival = arrivals()[arrivalCount()];
+  if (nextArrival !== undefined) write('[data-arrival-timer]',secLeft(nextArrival-periodElapsed()) + ' 秒');
+  for (const table of s.tables) write('[data-seat-timer="' + table.seat + '"]',tableSeconds(table) + ' 秒');
+  if (s.away) write('[data-visit-timer]',secLeft(s.away.returnAt-Date.now()) + ' 秒');
+  write('[data-energy-count]',s.energy.value + ' / ' + energyCap + ' 体力');
+  write('[data-energy-next]',energyNext());
+  if (s.puzzle?.status === 'playing') write('[data-board-timer]',boardSeconds() + ' 秒');
+  write('#rest-countdown',recoveryTime(careState(careCat)));
+  if (s.progress === 'finding') write('#timer',timerText());
 }
+function tick() {
+  const now = performance.now();
+  const elapsed = document.hidden ? 0 : Math.min(1000,Math.max(0,now-lastClockTick));
+  lastClockTick = now;
+  const oldClock = s.clockMs;
+  const changedClock = advanceClock(elapsed);
+  const changedEnergy = refreshEnergy();
+  const recovered = finishRecoveries();
+  const returned = finishVisit();
+  const attempt = s.puzzle;
+  if (attempt?.status === 'playing') {
+    if (!boardSeconds()) loseBoard();
+    else if (attempt.hideAt && Date.now() >= attempt.hideAt) {
+      attempt.open = [];
+      attempt.hideAt = 0;
+      update();
+    }
+  }
+  const cluesEnded = s.progress === 'finding' && !remaining();
+  if (cluesEnded) s.progress = 'choosing';
+  if (changedClock || changedEnergy || returned || cluesEnded || (oldClock !== s.clockMs && now-lastClockSave >= 1000)) {
+    lastClockSave = now;
+    save();
+  }
+  if (cluesEnded && tab === 'clues') { go('dispatch'); note('找线索时间结束，可以选猫了。'); }
+  else if ((changedClock || changedEnergy || recovered || returned || cluesEnded) && tab !== 'board' && tab !== 'story') refresh();
+  paintTimers();
+}
+document.addEventListener('visibilitychange', () => {
+  lastClockTick = performance.now();
+  save();
+});
+window.addEventListener('pagehide',save);
 const adoptionPrices = { 3:25, 4:42, 5:60 };
 const adoptionWeights = { 3:60, 4:30, 5:10 };
 const drawPrice = 20;
 const pityLimit = 5;
 const minWorkStamina = 50;
 const workCost = { 3:55, 4:45, 5:35 };
-const maxEnergy = 5;
 const maxShift = 4;
 const recoveryItems = {
   kibble: { name:'猫粮', cost:6, gain:55, seconds:45, stock:'kibble' },
@@ -1027,18 +987,10 @@ const recoveryItems = {
   bed: { name:'高级猫窝', cost:48, gain:100, seconds:32, owned:'bed' }
 };
 let careCat = 'sesame';
-let mergeSelected = null;
 
 function realDay() {
   const now = new Date();
   return Math.floor(Date.UTC(now.getFullYear(), now.getMonth(), now.getDate()) / 86400000);
-}
-function refreshEnergy() {
-  const today = realDay();
-  if (s.energy.day >= today) return;
-  s.energy.value = Math.min(maxEnergy, s.energy.value + 3 * (today - s.energy.day));
-  s.energy.day = today;
-  save();
 }
 function catIds() { return s.roster; }
 function catCapacity() { return s.capacity; }
@@ -1061,11 +1013,10 @@ function canOpen() { return s.cleared.includes(0) && catIds().length >= 3; }
 function renderOnboarding(clock) {
   const cleared = s.cleared.includes(0);
   const count = catIds().length;
-  refreshEnergy();
-  const action = !cleared ? (s.energy.value || s.puzzle?.status === 'playing' ? '<button class="primary wide" type="button" data-act="first-board">去备料挑战 · 第 1 关</button>' : '<p class="notice">体力用完了，本地零点恢复。</p>') :
+  const action = !cleared ? '<button class="primary wide" type="button" data-act="first-board">去翻牌备料 · 免费</button>' :
     count < 3 ? '<button class="primary wide" type="button" data-act="tab" data-id="adopt">去领养所招募猫咪</button>' :
     '<button class="primary wide" type="button" data-act="open-shop">三只猫就位，开门营业</button>';
-  workspace.innerHTML = '<section class="scene" aria-label="猫咖筹备"><img class="cafe-bg" draggable="false" src="assets/cafe.webp" alt=""><div class="sun-glint"></div>' + floorHeader(clock) + '<article class="opening-card panel"><p class="kicker">开店准备</p><h2 class="heading">招齐三只猫，准备开门</h2><ol class="opening-check"><li>' + (cleared ? '✓ ' : '') + '完成第 1 关备料挑战，领取 32 金币</li><li>' + (count >= 3 ? '✓ ' : '') + '招募至少三只猫 · ' + Math.min(3,count) + ' / 3</li><li>安排首班猫咪，开始营业</li></ol>' + action + '</article></section>';
+  workspace.innerHTML = '<section class="scene" aria-label="猫咖筹备"><img class="cafe-bg" draggable="false" src="assets/cafe.webp" alt=""><div class="sun-glint"></div>' + floorHeader(clock) + '<article class="opening-card panel"><p class="kicker">开店准备</p><h2 class="heading">招齐三只猫，准备开门</h2><ol class="opening-check"><li>' + (cleared ? '✓ ' : '') + '完成第一张翻牌订单，领取 32 金币</li><li>' + (count >= 3 ? '✓ ' : '') + '招募至少三只猫 · ' + Math.min(3,count) + ' / 3</li><li>安排首班猫咪，开始营业</li></ol>' + action + '</article></section>';
 }
 function remainingCats() { return Object.keys(cats).filter(id => !catIds().includes(id)); }
 function drawTiers(ids = remainingCats()) {
@@ -1145,7 +1096,7 @@ function renderShift() {
   const rows = catIds().map(id=>{
     const cat = cats[id], info = careState(id), assigned = s.shift.includes(id), busy = catBusy(id);
     const block = !s.opened || !!busy || (!assigned && (restRequired(id) || s.shift.length >= maxShift));
-    const label = busy || (restRequired(id) ? '精力不足，需休息' : assigned ? '当班' : '猫舍待命');
+    const label = (busy ? catStatus(id) : '') || (restRequired(id) ? '精力不足，需休息' : assigned ? '当班' : '猫舍待命');
     return '<article class="adoption-cat"><img src="' + avatars[id] + '" alt=""><div><h3>' + cat.name + ' · ' + cat.stars + ' 星</h3><p>精力 ' + info.stamina + ' / 100 · ' + label + '</p></div><button class="secondary" type="button" data-act="shift-cat" data-id="' + id + '" aria-label="' + (assigned ? '下班' : '上班') + cat.name + '" ' + (block ? 'disabled' : '') + '>' + (assigned ? '下班' : '上班') + '</button></article>';
   }).join('');
   screen('营业排班','按精力安排今日当班','<section class="panel"><h2 class="heading">当班 ' + s.shift.length + ' / ' + maxShift + '</h2><p class="copy">至少 50 精力才能接单。每桌三星消耗 55，四星 45，五星 35。低于 50 的猫会陪完这一桌，然后自动回猫舍。</p></section><section class="panel">' + (rows || '<p class="copy">先到领养所招募猫咪。</p>') + '</section><button class="secondary wide" type="button" data-act="tab" data-id="care">去猫舍安排休息</button>');
@@ -1193,113 +1144,191 @@ function careAction(act,id) {
   update();
 }
 
-const chains = {
-  b: { label:'咖啡原料箱', icons:['●','◉','☕','♨'], names:['咖啡豆','研磨粉','浓缩咖啡','手冲拼配'] },
-  m: { label:'乳品原料箱', icons:['♧','▥','♨','✿'], names:['鲜奶','奶缸','奶泡','奶油顶'] },
-  p: { label:'面点原料箱', icons:['✦','◈','◇','▰'], names:['面粉','面团','黄油酥','烘焙礼盒'] }
+const cardItems = {
+  latte:['☕','原味拿铁'], americano:['◕','美式咖啡'], cappuccino:['♨','卡布奇诺'], honey:['🍯','蜂蜜拿铁'],
+  sponge:['🍰','香草戚风'], honeycake:['🧁','蜂蜜磅蛋糕'], cookie:['🍪','黄油曲奇'], tea:['🍵','热茶'],
+  pudding:['🍮','焦糖布丁'], toast:['🍞','烤吐司']
 };
 const pantryLevels = [
-  { title:'开店第一杯', goals:['b2'], limit:6, reward:32 },
-  { title:'午后拿铁', goals:['b2','m2'], limit:11, reward:38 },
-  { title:'磨豆练习', goals:['b3','m1'], limit:14, reward:44 },
-  { title:'烘焙窗口', goals:['p2','m2','b2'], limit:16, reward:50 },
-  { title:'街坊下午茶', goals:['p3','m2','b2'], limit:20, reward:56 },
-  { title:'周末拼配单', goals:['b3','m3','p2'], limit:24, reward:64 },
-  { title:'烘焙师的大订单', goals:['b3','m3','p3'], limit:27, reward:76 },
-  { title:'阳光间的下午茶', goals:['b3','m3','p3','m1'], limit:27, reward:90 }
+  { title:'开店第一杯', goals:['latte','cookie'], pairs:4, seconds:55, reward:32 },
+  { title:'午后拿铁', goals:['latte','tea'], pairs:6, seconds:45, reward:38 },
+  { title:'磨豆练习', goals:['americano','cappuccino'], pairs:6, seconds:40, reward:44 },
+  { title:'烘焙窗口', goals:['sponge','honeycake','cookie'], pairs:6, seconds:50, reward:50 },
+  { title:'街坊下午茶', goals:['cappuccino','pudding','tea'], pairs:8, seconds:55, reward:56 },
+  { title:'周末拼配单', goals:['latte','honey','toast'], pairs:8, seconds:50, reward:64 },
+  { title:'烘焙师的大订单', goals:['sponge','honeycake','cookie','pudding'], pairs:8, seconds:55, reward:76 },
+  { title:'阳光间的下午茶', goals:['americano','cappuccino','sponge','honeycake'], pairs:8, seconds:50, reward:90 }
 ];
-function tileName(item) { return chains[item[0]].names[Number(item[1])]; }
-function tileContent(item) {
-  return '<i aria-hidden="true">' + chains[item[0]].icons[Number(item[1])] + '</i><small>' + tileName(item) + '</small>';
+function guestCoffee(guest) { return guest.coffee === 'honey' && !s.menu ? 'latte' : guest.coffee; }
+function guestDessert(guest) {
+  return [guest.dessert,'sponge','honeycake'].find(id=>s.pastries[id] > 0) ?? '';
 }
-function pantryEnergy() {
-  return '<span class="energy-label"><b aria-hidden="true">ϟ</b> 体力 ' + s.energy.value + ' / ' + maxEnergy + '</span>';
+function orderCost() { return s.orderAttempts < 3 ? 0 : regularOrderCost; }
+function energyText() {
+  return '<span data-energy-count>' + s.energy.value + ' / ' + energyCap + ' 体力</span> · <span data-energy-next>' + energyNext() + '</span>';
 }
-function renderPantry() {
-  refreshEnergy();
-  const active = s.puzzle?.status === 'playing';
-  const morning = s.morning ? '<section class="panel"><h2 class="heading">开店前的晨间订单</h2><p class="copy">免费合一份浓缩咖啡，领 24 金币后开门。</p><button class="primary wide" type="button" data-act="morning-board">' + (active ? '继续当前订单' : '开始晨间订单') + '</button></section>' : '';
-  const list = pantryLevels.map((level,index) => {
-    const unlocked = index === 0 || s.cleared.includes(index-1);
-    const cleared = s.cleared.includes(index);
-    const resume = active && s.puzzle.level === index;
-    const reward = cleared ? 12 : level.reward;
-    return '<article class="level-row"><span class="level-no">' + String(index+1).padStart(2,'0') + '</span><div><h3>' + level.title + '</h3><p>' + (unlocked ? level.goals.map(tileName).join(' · ') : '完成上一关解锁') + '</p></div><button class="secondary" type="button" data-act="level" data-id="' + index + '" ' + (!unlocked || (!resume && (active || !s.energy.value)) ? 'disabled' : '') + '>' + (resume ? '继续' : unlocked ? (cleared ? '重玩 · +' : '开局 · +') + reward : '未解锁') + '</button></article>';
-  }).join('');
-  screen('备料挑战','二合订单 / 街角工坊',morning + '<section class="panel pantry-intro"><div class="line-item">' + pantryEnergy() + '<b>金币 ' + s.coins + '</b></div><h2 class="heading">合成订单，赚猫猫零花钱</h2><p class="copy">开一局消耗 1 点体力。每天本地零点恢复 3 点，最多存 5 点。每关首通奖励不同，重玩通关也可得 12 金币。</p></section><section class="panel">' + list + '</section>');
+function energyNext() {
+  if (s.energy.value >= energyCap) return '已满';
+  const seconds = secLeft(energyInterval - Math.max(0,Date.now()-s.energy.updatedAt));
+  return String(Math.floor(seconds/60)).padStart(2,'0') + ':' + String(seconds%60).padStart(2,'0') + ' 回 1';
 }
-function startPantry(index) {
-  refreshEnergy();
-  if (s.puzzle?.status === 'playing') {
-    if (s.puzzle.level === index) go('board');
-    return;
-  }
-  const morning = s.morning && index === 0;
-  if (!pantryLevels[index] || (!morning && !s.energy.value) || (index && !s.cleared.includes(index-1))) return;
-  if (!morning) s.energy.value -= 1;
-  s.puzzle = { level:index, board:Array(16).fill(null), delivered:[], supplies:pantryLevels[index].limit, status:'playing', reward:0, morning };
-  mergeSelected = null;
-  save(); go('board');
-}
-function renderBoard() {
-  const attempt = s.puzzle;
-  const level = pantryLevels[attempt.level];
-  const board = attempt.board.map((item,index)=>'<button type="button" class="merge-tile ' + (item ? 'tile-' + item[0] : 'tile-empty') + (mergeSelected === index ? ' picked' : '') + '" data-act="tile" data-id="' + index + '" aria-pressed="' + (mergeSelected === index) + '" aria-label="' + (item ? tileName(item) : '空格') + '，第 ' + (index+1) + ' 格">' + (item ? tileContent(item) : '') + '</button>').join('');
-  const goals = level.goals.map(item=>'<button type="button" class="goal tile-' + item[0] + '" data-act="deliver" data-id="' + item + '" ' + (attempt.delivered.includes(item) || !attempt.board.includes(item) ? 'disabled' : '') + '>' + tileContent(item) + '<span>' + (attempt.delivered.includes(item) ? '已交付' : '交付') + '</span></button>').join('');
-  const boxes = [...new Set(level.goals.map(item=>item[0]))].map(key=>'<button class="secondary" type="button" data-act="spawn" data-id="' + key + '" ' + (!attempt.supplies || !attempt.board.includes(null) ? 'disabled' : '') + '>' + chains[key].label + '</button>').join('');
-  const done = attempt.status === 'won';
-  screen('备料挑战 · 第 ' + (attempt.level+1) + ' 关',level.title,done ? '<section class="panel"><h2 class="heading">订单全部完成</h2><p class="reward-number">+' + attempt.reward + ' 金币</p><p class="copy">已经放进猫咖账本，可用来领养、买玩具和罐头。</p><button class="primary wide" type="button" data-act="tab" data-id="' + (attempt.morning ? 'shop' : !s.opened ? (catIds().length < 3 ? 'adopt' : 'shop') : 'pantry') + '">' + (attempt.morning ? '带上金币，开门营业' : !s.opened ? (catIds().length < 3 ? '拿金币去招募猫咪' : '回店准备开门') : '返回关卡') + '</button></section>' : '<section class="panel"><div class="line-item">' + pantryEnergy() + '<b>剩余取料 ' + attempt.supplies + '</b></div><div class="merge-goals">' + goals + '</div><div class="merge-board" aria-label="合成棋盘">' + board + '</div><div class="actions merge-boxes">' + boxes + '</div><p class="copy">点原料箱取料，把两个相同原料拖到一起，或依次点选两格。合成目标后点上方交付。</p><div class="actions"><button class="secondary" type="button" data-act="discard" ' + (mergeSelected === null ? 'disabled' : '') + '>清掉所选格</button><button class="secondary" type="button" data-act="abandon">放弃本局</button></div></section>','pantry');
-}
-function mergeTiles(from,to) {
-  const board = s.puzzle.board;
-  if (from === to || !board[from]) return false;
-  if (!board[to]) {
-    board[to] = board[from]; board[from] = null;
-  } else if (board[to] === board[from] && Number(board[from][1]) < chains[board[from][0]].names.length-1) {
-    board[to] = board[from][0] + (Number(board[from][1])+1); board[from] = null;
-  } else {
-    note('需要两个相同、可升级的原料。');
-    return false;
-  }
-  mergeSelected = null;
-  update();
+function refreshEnergy() {
+  const now = Date.now();
+  if (s.energy.value >= energyCap) return false;
+  if (now < s.energy.updatedAt) s.energy.updatedAt = now;
+  const steps = Math.floor((now-s.energy.updatedAt)/energyInterval);
+  if (!steps) return false;
+  s.energy.value = Math.min(energyCap,s.energy.value+steps);
+  s.energy.updatedAt = s.energy.value === energyCap ? now : s.energy.updatedAt+steps*energyInterval;
   return true;
 }
-function pantryAction(act,id) {
-  const attempt = s.puzzle;
-  if (tab !== 'board' || attempt?.status !== 'playing') return;
-  const level = pantryLevels[attempt.level];
-  const board = attempt.board;
-  if (act === 'tile') {
-    const next = Number(id);
-    if (mergeSelected !== null && mergeTiles(mergeSelected,next)) return;
-    mergeSelected = board[next] && mergeSelected !== next ? next : null;
-    refresh();
-    workspace.querySelector('[data-act="tile"][data-id="' + next + '"]')?.focus({preventScroll:true});
-  } else if (act === 'spawn' && level.goals.some(item=>item[0] === id) && attempt.supplies && board.includes(null)) {
-    board[board.indexOf(null)] = id+'0'; attempt.supplies -= 1; update();
-  } else if (act === 'discard' && mergeSelected !== null) {
-    board[mergeSelected] = null; mergeSelected = null; update();
-  } else if (act === 'deliver' && level.goals.includes(id) && board.includes(id) && !attempt.delivered.includes(id)) {
-    board[board.indexOf(id)] = null; attempt.delivered.push(id); mergeSelected = null;
-    if (attempt.delivered.length === level.goals.length) {
-      const first = !s.cleared.includes(attempt.level);
-      attempt.morning = s.morning;
-      attempt.reward = attempt.morning ? 24 : first ? level.reward : 12;
-      if (attempt.morning) s.morning = false;
-      if (first) s.cleared.push(attempt.level);
-      s.coins += attempt.reward;
-      attempt.status = 'won';
-    }
-    update();
-  } else if (act === 'abandon') {
-    dialog.innerHTML = '<div class="dialog-top"><h2 class="heading" id="dialog-title">放弃这局？</h2><button class="close" type="button" data-act="close" aria-label="关闭">×</button></div><p class="copy">' + (attempt.morning ? '晨间订单可以免费重试。' : '本局消耗的 1 点体力会保留为已使用，未交完的订单不会发奖。') + '</p><div class="actions"><button class="secondary" type="button" data-act="close">继续玩</button><button class="primary" type="button" data-act="confirm-abandon">确认放弃</button></div>';
-    dialog.setAttribute('aria-labelledby','dialog-title');
-    dialog.showModal();
+function spendEnergy(cost) {
+  refreshEnergy();
+  if (s.energy.value < cost) return false;
+  if (cost && s.energy.value === energyCap) s.energy.updatedAt = Date.now();
+  s.energy.value -= cost;
+  return true;
+}
+function pantryCostFor(index) {
+  return index === 0 && (!s.opened && !s.cleared.includes(0)) ? 0 : pantryCost;
+}
+function renderPantry() {
+  const morning = s.morning ? '<section class="panel"><h2 class="heading">晨间订单</h2><p class="copy">免费找齐早班的两样餐品，领 24 金币后开门。</p>' + actionButton('开始晨间订单','morning-board','','primary wide') + '</section>' : '';
+  const list = pantryLevels.map((level,index)=>{
+    const unlocked = index === 0 || s.cleared.includes(index-1);
+    const reward = s.cleared.includes(index) ? 12 : level.reward;
+    const cost = pantryCostFor(index);
+    return '<article class="level-row"><span class="level-no">' + String(index+1).padStart(2,'0') + '</span><div><h3>' + level.title + '</h3><p>' + (unlocked ? level.goals.map(id=>cardItems[id][1]).join(' · ') + ' · ' + (cost ? cost + ' 点体力' : '免费') : '完成上一关解锁') + '</p></div><button class="secondary" type="button" data-act="level" data-id="' + index + '" ' + (!unlocked || s.energy.value < cost ? 'disabled' : '') + '>' + (unlocked ? '开局 · +' + reward : '未解锁') + '</button></article>';
+  }).join('');
+  screen('备料挑战','翻牌配对 · 赚金币',morning + '<section class="panel pantry-intro"><div class="line-item"><b class="energy-label">' + energyText() + '</b><b>金币 ' + s.coins + '</b></div><h2 class="heading">给街坊备一份餐</h2><p class="copy">找到订单指定的对子。普通挑战消耗 4 点体力，每 2 分钟恢复 1 点，离线也恢复。</p></section><section class="panel">' + list + '</section>');
+}
+function shuffle(items) {
+  for (let i=items.length-1;i>0;i-=1) {
+    const j=Math.floor(Math.random()*(i+1));
+    [items[i],items[j]]=[items[j],items[i]];
   }
+  return items;
+}
+function startBoard({goals,pairs,seconds,kind,cost,level=0,order=null}) {
+  if (boardActive() || !spendEnergy(cost)) return false;
+  const fillers = shuffle(Object.keys(cardItems).filter(id=>!goals.includes(id)));
+  const faces = [...goals,...fillers.slice(0,pairs-goals.length)];
+  s.puzzle = { kind,level,order,cost,goals,deck:shuffle([...faces,...faces]),matched:[],open:[],hideAt:0,status:'playing',deadline:Date.now()+seconds*1000 };
+  if (order) {
+    s.orderAttempts += 1;
+    s.arrivalsUsed += 1;
+    s.guest += (order.index-s.guest%guests.length+guests.length)%guests.length+1;
+  }
+  lastClockTick = performance.now();
+  save(); go('board');
+  return true;
+}
+function startPantry(index, morning=false) {
+  if (!pantryLevels[index] || (morning && !s.morning) || (!morning && index && !s.cleared.includes(index-1))) return;
+  const level = pantryLevels[index];
+  startBoard({...level,kind:morning ? 'morning' : 'pantry',level:index,cost:morning ? 0 : pantryCostFor(index)});
+}
+function startOrder() {
+  const index = orderGuest;
+  if (tab !== 'order' || !waitingCount() || Math.floor(s.clockMs/periodMs) !== orderPeriod || orderProblem(index) || !selected || staffStatus(selected)) return;
+  const guest = guests[index];
+  const coffee = guestCoffee(guest);
+  const dessert = guestDessert(guest);
+  const order = { index,coffee,dessert,cat:selected,seat:availableSeat() };
+  startBoard({goals:dessert ? [coffee,dessert] : [coffee],pairs:6,seconds:45,kind:'order',cost:orderCost(),order});
+}
+function boardSeconds() { return secLeft(s.puzzle.deadline-Date.now()); }
+function renderBoard() {
+  const attempt = s.puzzle;
+  if (!attempt) { go('pantry'); return; }
+  const order = attempt.order;
+  const title = order ? guests[order.index].name + '的订单' : attempt.kind === 'morning' ? '晨间订单' : '备料 · ' + pantryLevels[attempt.level].title;
+  if (attempt.status === 'won' || attempt.status === 'lost') {
+    const won = attempt.status === 'won';
+    const dest = order || attempt.kind === 'morning' ? 'shop' : won && !s.opened ? (catIds().length < 3 ? 'adopt' : 'shop') : 'pantry';
+    const label = dest === 'adopt' ? '带上金币，去领养猫咪' : dest === 'shop' ? '回猫咖' : '返回备料挑战';
+    const copy = won ? (order ? cats[order.cat].name + '已陪客人入座。' : '金币已记入账本。') :
+      order ? '客人已经离开，桌位和猫咪已释放。原料和猫咪精力没有扣除。' : '这局没能交齐订单，可以再试一次。';
+    screen(title,'翻牌配对','<section class="panel"><h2 class="heading">' + (won ? '订单完成' : '订单未完成') + '</h2>' + (won ? '<p class="reward-number">+' + attempt.reward + ' 金币</p>' : '') + '<p class="copy">' + copy + '</p>' + actionButton(label,'tab',dest,'primary wide') + '</section>',dest);
+    return;
+  }
+  const ready = attempt.status === 'ready';
+  const goals = attempt.goals.map(id=>'<span class="pair-target' + (attempt.matched.includes(id) ? ' done' : '') + '"><i aria-hidden="true">' + cardItems[id][0] + '</i>' + cardItems[id][1] + (attempt.matched.includes(id) ? ' ✓' : '') + '</span>').join('');
+  const cards = attempt.deck.map((id,index)=>{
+    const matched = attempt.matched.includes(id);
+    const open = attempt.open.includes(index);
+    const visible = matched || open;
+    const label = visible ? cardItems[id][1] + (matched ? '，已配对' : '') : '翻开第 ' + (index+1) + ' 张牌';
+    return '<button type="button" class="pair-card' + (open ? ' face-up' : '') + (matched ? ' matched' : '') + '" data-act="flip" data-id="' + index + '" aria-label="' + label + '" ' + (matched || ready ? 'disabled' : '') + '><i aria-hidden="true">' + (visible ? cardItems[id][0] : '✦') + '</i>' + (visible ? '<small>' + cardItems[id][1] + '</small>' : '') + '</button>';
+  }).join('');
+  screen(title,order ? '翻牌期间营业时钟暂停' : '找齐订单上的对子','<section class="panel pair-panel"><div class="line-item"><b class="energy-label">' + energyText() + '</b><strong class="pair-timer" data-board-timer>' + (ready ? '已配齐' : boardSeconds() + ' 秒') + '</strong></div><div class="pair-targets" aria-label="订单目标">' + goals + '</div><div class="pair-board" aria-label="翻牌棋盘">' + cards + '</div><p class="copy">' + (ready ? '餐品已配齐，可以提交订单。' : '每次翻两张牌。配对成功会消除，只有上方指定餐品计入订单。') + '</p>' + (ready ? actionButton('提交订单','submit-board','','primary wide') : actionButton('放弃本局','abandon','','secondary wide')) + '</section>',ready ? '' : 'abandon-board');
+}
+function flipCard(index) {
+  const attempt = s.puzzle;
+  if (tab !== 'board' || attempt?.status !== 'playing' || !boardSeconds() || attempt.open.length >= 2 || attempt.open.includes(index) || !attempt.deck[index] || attempt.matched.includes(attempt.deck[index])) return;
+  const first = attempt.open[0];
+  attempt.open.push(index);
+  if (first !== undefined) {
+    if (attempt.deck[first] === attempt.deck[index]) {
+      attempt.matched.push(attempt.deck[index]);
+      attempt.open = [];
+      if (attempt.goals.every(id=>attempt.matched.includes(id))) attempt.status = 'ready';
+    } else attempt.hideAt = Date.now()+650;
+  }
+  update();
+  workspace.querySelector(attempt.status === 'ready' ? '[data-act="submit-board"]' : '[data-act="flip"][data-id="' + index + '"]:not(:disabled)')?.focus({preventScroll:true});
+}
+function submitBoard() {
+  const attempt = s.puzzle;
+  if (tab !== 'board' || attempt?.status !== 'ready') return;
+  let reward;
+  if (attempt.order) {
+    const { index,coffee,dessert,cat,seat } = attempt.order;
+    const guest = guests[index];
+    const sought = { sesame:'安静',pudding:'爱玩',chestnut:'好奇' }[guest.cat];
+    const match = catTags(cats[cat]).includes(sought);
+    reward = 12 + (match ? 6 : 0) + (careState(cat).bond >= 2 ? 2 : 0) + (s.workers.barista || 0)*2 + (pastryMenu[dessert]?.price || 0);
+    for (const key of coffeeMenu[coffee].stock) s[key] -= 1;
+    if (dessert) s.pastries[dessert] -= 1;
+    s.points += match ? 2 : 1;
+    s.served += 1;
+    if (s.progress === 'locked') s.progress = 'ready';
+    s.tables.push({seat,guest:index,cat,leaveAt:s.clockMs+guest.stay*hourMs});
+    diningRoom = Math.floor(seat/4);
+    lounge = false;
+    joiningSeat = seat;
+    consumeWork(cat);
+  } else if (attempt.kind === 'morning') {
+    reward = 24;
+    s.morning = false;
+  } else {
+    const first = !s.cleared.includes(attempt.level);
+    reward = first ? pantryLevels[attempt.level].reward : 12;
+    if (first) s.cleared.push(attempt.level);
+  }
+  s.coins += reward;
+  attempt.reward = reward;
+  attempt.status = 'won';
+  lastClockTick = performance.now();
+  if (attempt.order) {
+    save(); go('shop');
+    note(guests[attempt.order.index].name + '已入座 · +' + reward + ' 金币');
+  } else update();
+}
+function abandonBoard() {
+  if (tab !== 'board' || s.puzzle?.status !== 'playing') return;
+  dialog.innerHTML = '<div class="dialog-top"><h2 class="heading" id="dialog-title">放弃这局？</h2><button class="close" type="button" data-act="close" aria-label="关闭">×</button></div><p class="copy">' + (s.puzzle.order ? '客人会离开。' : '') + (s.puzzle.cost ? '已消耗的体力不会返还。' : '本局免费。') + '</p><div class="actions">' + actionButton('继续玩','close','','secondary') + actionButton('确认放弃','confirm-abandon') + '</div>';
+  dialog.setAttribute('aria-labelledby','dialog-title');
+  dialog.showModal();
+}
+function loseBoard() {
+  if (s.puzzle?.status !== 'playing') return;
+  s.puzzle.status = 'lost';
+  lastClockTick = performance.now();
+  if (dialog.open) dialog.close();
+  update();
 }
 
-finishRecoveries();
-render();
 tick();
+render();
 setInterval(tick, 250);
